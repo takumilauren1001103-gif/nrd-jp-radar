@@ -1,0 +1,9 @@
+{
+  "name": "nrd-jp-radar-crawler",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@netlify/blobs": "^8.1.0",
+    "adm-zip": "^0.5.14"
+  }
+}
