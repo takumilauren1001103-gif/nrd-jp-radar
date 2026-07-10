@@ -27,15 +27,19 @@ function makeMockStore() {
 }
 
 // ---------------- 設定 ----------------
-const CONCURRENCY = 300;        // 並列プローブ数
+const CONCURRENCY = 45;        // 並列プローブ数
 const FETCH_TIMEOUT = 6000;     // 1ドメインのタイムアウト(ms)
 const PROBE_BUDGET_MS = 140 * 60 * 1000; // プローブ全体の時間上限(超過分は明日回し)
 const BODY_CAP = 65536;         // HTML読み取り上限(バイト)
 
-// 監視の階層: strong=.jp/かな(少数・気長に21日) / weak=汎用ダーク(大量・短く8日)
-// サイトは登録後数日で公開されることが多いので、汎用ダークは短窓＋間引きで負荷を抑える
-const WATCH_MAX = { strong: 21, weak: 8 };
-const SCHEDULE = { strong: new Set([1,2,3,5,7,10,13,16,19,21]), weak: new Set([1,2,3,5,7]) };
+// 監視の階層:
+//  strong = .jp/かな/日本語気配 (②日本っぽい未公開) → 60日じっくり追う
+//  weak   = 正体不明ダーク       (③不明な未公開)    → 30日追う(頻度は粗めに間引き)
+const WATCH_MAX = { strong: 60, weak: 30 };
+const SCHEDULE = {
+  strong: new Set([1,2,3,5,7,10,14,21,28,35,42,49,56]),  // 序盤は密、後半は週1
+  weak:   new Set([1,2,4,7,14,21,28]),                   // 不明は粗く(公開は登録直後が多い)
+};
 
 // 捨てるTLD（スパム系・日本企業がまず使わない）
 const JUNK_TLD = new Set(("xyz top sbs cyou icu buzz click vip cfd bond rest lol bid win loan gdn men date racing " +
@@ -184,7 +188,13 @@ async function probeOnce(url) {
 
 async function probe(domain) {
   // DNS事前チェック: 引けないドメインはHTTPを試さず即DEAD（大量の未公開ドメインを高速処理）
-  try { await lookup(domain); } catch { return { state: "DEAD" }; }
+  // DNS lookup自体にタイムアウトがなくハングすることがあるため明示的に打ち切る
+  try {
+    await Promise.race([
+      lookup(domain),
+      new Promise((_, rej) => setTimeout(() => rej(new Error("dns timeout")), 2500)),
+    ]);
+  } catch { return { state: "DEAD" }; }
   let r = null;
   for (const url of [`http://${domain}/`, `https://${domain}/`]) {
     try { r = await probeOnce(url); break; } catch { r = null; }
@@ -255,7 +265,8 @@ async function main() {
   if (!nrd) { console.error("whoisdsのダウンロードに失敗"); process.exit(1); }
   const fresh = preFilter(nrd.list);
   console.log(`filter: ${nrd.list.length} -> ${fresh.length} probe対象`);
-  if (process.env.NRD_JPFIRST) fresh.sort((a, b) => (b.jpHint || 0) - (a.jpHint || 0));
+  // 日本っぽい(.jp/かな)ドメインを最優先で処理 → 時間切れで打ち切っても本命は必ず処理される
+  fresh.sort((a, b) => (b.jpHint || 0) - (a.jpHint || 0));
   if (process.env.NRD_SAMPLE) { fresh.length = Math.min(fresh.length, +process.env.NRD_SAMPLE); console.log(`(sample mode: ${fresh.length})`); }
 
   // 2) 監視リスト読込（日別ファイル）— エントリ単位で階層別に「今日調べる/据え置き/期限切れ」を判定
