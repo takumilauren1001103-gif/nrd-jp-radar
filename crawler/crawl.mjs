@@ -6,6 +6,7 @@
 // ============================================================
 import { getStore } from "@netlify/blobs";
 import AdmZip from "adm-zip";
+import { lookup } from "node:dns/promises";
 
 const SITE_ID = process.env.BLOBS_SITE_ID;
 const TOKEN = process.env.BLOBS_TOKEN;
@@ -26,8 +27,9 @@ function makeMockStore() {
 }
 
 // ---------------- 設定 ----------------
-const CONCURRENCY = 150;        // 並列プローブ数
-const FETCH_TIMEOUT = 8000;     // 1ドメインのタイムアウト(ms)
+const CONCURRENCY = 300;        // 並列プローブ数
+const FETCH_TIMEOUT = 6000;     // 1ドメインのタイムアウト(ms)
+const PROBE_BUDGET_MS = 140 * 60 * 1000; // プローブ全体の時間上限(超過分は明日回し)
 const BODY_CAP = 65536;         // HTML読み取り上限(バイト)
 
 // 監視の階層: strong=.jp/かな(少数・気長に21日) / weak=汎用ダーク(大量・短く8日)
@@ -181,6 +183,8 @@ async function probeOnce(url) {
 }
 
 async function probe(domain) {
+  // DNS事前チェック: 引けないドメインはHTTPを試さず即DEAD（大量の未公開ドメインを高速処理）
+  try { await lookup(domain); } catch { return { state: "DEAD" }; }
   let r = null;
   for (const url of [`http://${domain}/`, `https://${domain}/`]) {
     try { r = await probeOnce(url); break; } catch { r = null; }
@@ -204,23 +208,41 @@ async function probe(domain) {
 
 async function pool(items, worker, size) {
   const results = new Array(items.length);
-  let idx = 0, done = 0;
+  let idx = 0, done = 0, skipped = 0;
   const t0 = Date.now();
   await Promise.all(Array.from({ length: Math.min(size, items.length) }, async () => {
     while (idx < items.length) {
       const i = idx++;
+      if (Date.now() - t0 > PROBE_BUDGET_MS) { results[i] = { state: "DEAD" }; skipped++; continue; } // 時間切れ分は明日回し
       results[i] = await worker(items[i]).catch(() => ({ state: "DEAD" }));
       if (++done % 2000 === 0) console.log(`  probed ${done}/${items.length} (${Math.round((Date.now() - t0) / 1000)}s)`);
     }
   }));
+  if (skipped) console.warn(`時間上限により ${skipped} 件をスキップ（監視リストで明日再チェック）`);
   return results;
 }
 
 // ---------------- Blobs I/O ----------------
-async function getJSON(key, fallback) {
-  try { const v = await store.get(key, { type: "json" }); return v ?? fallback; } catch { return fallback; }
+// ---------------- Blobs I/O（自動リトライ付き：一時的な通信エラーで成果を失わない） ----------------
+async function withRetry(fn, label, tries = 5) {
+  let last;
+  for (let i = 0; i < tries; i++) {
+    try { return await fn(); }
+    catch (e) {
+      last = e;
+      const wait = 2000 * 2 ** i; // 2s,4s,8s,16s,32s
+      console.warn(`${label} 失敗 (${i + 1}/${tries}): ${e.message} → ${wait / 1000}s後に再試行`);
+      await new Promise(r => setTimeout(r, wait));
+    }
+  }
+  throw last;
 }
-const setJSON = (key, val) => store.setJSON(key, val);
+async function getJSON(key, fallback) {
+  // キーが無い場合は null → fallback。通信エラーはリトライし、最終的に失敗なら run を止める
+  // （台帳を読めないまま上書き保存して過去データを消すのを防ぐ）
+  return withRetry(async () => { const v = await store.get(key, { type: "json" }); return v ?? fallback; }, `get ${key}`);
+}
+const setJSON = (key, val) => withRetry(() => store.setJSON(key, val), `set ${key}`);
 
 // ---------------- メイン ----------------
 async function main() {
