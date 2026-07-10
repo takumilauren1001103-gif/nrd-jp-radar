@@ -1,0 +1,27 @@
+name: NRD JP Radar Daily
+
+on:
+  schedule:
+    - cron: '30 21 * * *'   # 21:30 UTC = 06:30 JST
+  workflow_dispatch: {}
+
+concurrency:
+  group: nrd-radar
+  cancel-in-progress: false
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install deps
+        run: cd crawler && npm install --no-audit --no-fund
+      - name: Run crawler
+        run: cd crawler && node crawl.mjs
+        env:
+          BLOBS_SITE_ID: ${{ secrets.BLOBS_SITE_ID }}
+          BLOBS_TOKEN: ${{ secrets.BLOBS_TOKEN }}
