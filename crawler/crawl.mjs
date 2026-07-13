@@ -7,25 +7,6 @@
 import { getStore } from "@netlify/blobs";
 import AdmZip from "adm-zip";
 import { lookup } from "node:dns/promises";
-import { fetch as probeFetch, Agent } from "undici";
-
-// プローブ専用の接続エージェント: 使い捨て設定でソケット/ポート枯渇を防ぐ
-// (9万接続をキープし続けると終盤にNetlifyへ繋ぐ余力がなくなり保存が死ぬ)
-function newProbeAgent() {
-  return new Agent({
-    connections: 1,               // 相手先ごとに1本まで
-    keepAliveTimeout: 500,        // 使い終わったら0.5秒で切断
-    keepAliveMaxTimeout: 500,
-    connect: { timeout: 5000 },
-  });
-}
-let probeAgent = newProbeAgent();
-function rotateProbeAgent() {     // 定期的に丸ごと作り直してメモリと接続台帳を掃除
-  const old = probeAgent;
-  probeAgent = newProbeAgent();
-  old.close().catch(() => {});
-}
-async function shutdownProbeAgent() { try { await probeAgent.destroy(); } catch {} }
 
 const SITE_ID = process.env.BLOBS_SITE_ID;
 const TOKEN = process.env.BLOBS_TOKEN;
@@ -196,9 +177,8 @@ function sniffDecode(buf, headerCT) {
 }
 
 async function probeOnce(url) {
-  const res = await probeFetch(url, {
+  const res = await fetch(url, {
     redirect: "follow",
-    dispatcher: probeAgent,
     headers: { "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "accept-language": "ja,en;q=0.8" },
     signal: AbortSignal.timeout(FETCH_TIMEOUT),
   });
@@ -236,17 +216,18 @@ async function probe(domain) {
   return { state: "LIVE_OTHER" };
 }
 
-async function pool(items, worker, size) {
+async function pool(items, worker, size, ctx = {}) {
   const results = new Array(items.length);
+  const { offset = 0, total = items.length, deadline = Infinity } = ctx;
   let idx = 0, done = 0, skipped = 0;
   const t0 = Date.now();
   await Promise.all(Array.from({ length: Math.min(size, items.length) }, async () => {
     while (idx < items.length) {
       const i = idx++;
-      if (Date.now() - t0 > PROBE_BUDGET_MS) { results[i] = { state: "DEAD" }; skipped++; continue; } // 時間切れ分は明日回し
+      if (Date.now() > deadline) { results[i] = { state: "DEAD" }; skipped++; continue; } // 時間切れ分は明日回し
       results[i] = await worker(items[i]).catch(() => ({ state: "DEAD" }));
-      if (++done % 2000 === 0) console.log(`  probed ${done}/${items.length} (${Math.round((Date.now() - t0) / 1000)}s)`);
-      if (done % 5000 === 0) rotateProbeAgent(); // 接続台帳の定期掃除
+      const g = offset + ++done;
+      if (g % 2000 === 0) console.log(`  probed ${g}/${total} (${Math.round((Date.now() - t0) / 1000)}s in chunk)`);
     }
   }));
   if (skipped) console.warn(`時間上限により ${skipped} 件をスキップ（監視リストで明日再チェック）`);
@@ -261,7 +242,7 @@ async function withRetry(fn, label, tries = 5) {
     try { return await fn(); }
     catch (e) {
       last = e;
-      const wait = 2000 * 2 ** i; // 2s,4s,8s,16s,32s
+      const wait = Math.min(2000 * 2 ** i, 90000); // 2s,4s,8s,...上限90s
       console.warn(`${label} 失敗 (${i + 1}/${tries}): ${e.message} → ${wait / 1000}s後に再試行`);
       await new Promise(r => setTimeout(r, wait));
     }
@@ -276,8 +257,22 @@ async function getJSON(key, fallback) {
 const setJSON = (key, val) => withRetry(() => store.setJSON(key, val), `set ${key}`);
 
 // ---------------- メイン ----------------
+// 起動時カナリア: 確実に生きている日本サイトが1つも検出できない = ランナーのネットワーク不調。
+// 全件DEAD誤判定で1日を無駄にする前に、台帳に触らず中止する。
+async function canaryCheck() {
+  const canaries = ["www.yahoo.co.jp", "www.google.co.jp", "www.nhk.or.jp"];
+  const rs = await Promise.all(canaries.map(d => probe(d)));
+  const ok = rs.filter(r => r.state === "LIVE_JP").length;
+  console.log(`canary: ${ok}/${canaries.length} 検出`);
+  if (ok === 0) {
+    console.error("カナリア全滅: ランナーのネットワークが不調のため中止（台帳は無変更・次回の定時実行で自動リトライ）");
+    process.exit(1);
+  }
+}
+
 async function main() {
   initStore();
+  await canaryCheck();
   const today = todayISO();
   console.log(`=== NRD JP Radar crawl ${today} ===`);
 
@@ -311,26 +306,23 @@ async function main() {
   const month = today.slice(0, 7);
   const results = await getJSON(`results/${month}.json`, []);
   const stats = await getJSON("meta/stats.json", { days: [] });
+  const known = new Set(results.map(r => r.d));
 
-  // 4) プローブ（新規 + 監視分）
+  // 4) クラッシュ耐性のある監視台帳: 先に全対象を「保留」として登録し、判定のたびに更新/削除。
+  //    どの時点で保存が走っても台帳として一貫しており、途中で死んでも翌日拾い直せる。
+  const watchMap = new Map(); // d -> {d, uni?, jp, st, reg}
+  for (const [regDate, entries] of Object.entries(keepByReg))
+    for (const e of entries) watchMap.set(e.d, { ...e, reg: regDate });
   const newItems = fresh.map(f => ({ d: f.d, uni: f.uni, jpHint: f.jpHint, reg: nrd.date, isNew: true }));
   const all = [...newItems, ...watchDue];
-  console.log(`probing ${all.length} domains @${CONCURRENCY} parallel ...`);
-  const res = await pool(all, item => probe(item.d), CONCURRENCY);
-  await shutdownProbeAgent();                    // プローブ接続を完全破棄
-  await new Promise(r => setTimeout(r, 3000));   // ソケットの後始末を待つ
+  for (const it of all)
+    watchMap.set(it.d, { d: it.d, uni: it.uni !== it.d ? it.uni : undefined, jp: it.jpHint || 0, st: it.st || "PEND", reg: it.reg });
 
-  // 5) 振り分け
-  const known = new Set(results.map(r => r.d));
-  const newWatch = {}; // regDate -> entries
-  // 据え置き分を先にマージ
-  for (const [regDate, entries] of Object.entries(keepByReg)) (newWatch[regDate] ||= []).push(...entries);
-  let cJp = 0, cWatch = 0, cDrop = 0;
-
-  all.forEach((item, i) => {
-    const r = res[i];
+  let cJp = 0, cDrop = 0;
+  function dispatch(item, r) {
     const jpHint = item.jpHint || r.jp || 0;
     if (r.state === "LIVE_JP") {
+      watchMap.delete(item.d);
       if (!known.has(item.d)) {
         results.push({
           d: item.d, uni: item.uni !== item.d ? item.uni : undefined,
@@ -340,32 +332,60 @@ async function main() {
         known.add(item.d); cJp++;
       }
     } else if (r.state === "CN" || r.state === "LIVE_OTHER") {
-      cDrop++; // 公開済みだが日本語なし → 恒久除外（監視に戻さない）
+      watchMap.delete(item.d); cDrop++;   // 公開済みだが日本語なし → 恒久除外
     } else {
-      // DEAD / PARKED / TINY → 監視継続（.jp・かな・日本語気配は strong 扱い）
-      (newWatch[item.reg] ||= []).push({ d: item.d, uni: item.uni !== item.d ? item.uni : undefined, jp: jpHint, st: r.state });
-      cWatch++;
+      const w = watchMap.get(item.d);
+      if (w) { w.st = r.state; w.jp = w.jp || jpHint; }  // DEAD/PARKED/TINY → 監視継続
     }
-  });
+  }
 
-  // 5) 保存（不要になった日付ファイルは削除）
+  // 保存一式（チェックポイント兼最終保存）
   const oldDates = new Set(watchIndex);
-  const dates = Object.keys(newWatch).filter(dt => newWatch[dt].length).sort();
-  const keepSet = new Set(dates);
-  for (const dt of oldDates) if (!keepSet.has(dt)) { try { await store.delete(`watch/${dt}.json`); } catch {} }
-  results.sort((a, b) => (a.pub < b.pub ? 1 : -1));
-  await setJSON(`results/${month}.json`, results);
-  let watchTotal = 0;
-  for (const dt of dates) { await setJSON(`watch/${dt}.json`, newWatch[dt]); watchTotal += newWatch[dt].length; }
-  await setJSON("watch/index.json", dates);
+  async function saveAll(final) {
+    const tries = final ? 8 : 3;
+    const byReg = {};
+    for (const w of watchMap.values()) (byReg[w.reg] ||= []).push({ d: w.d, uni: w.uni, jp: w.jp, st: w.st });
+    const dates = Object.keys(byReg).sort();
+    results.sort((a, b) => (a.pub < b.pub ? 1 : -1));
+    await withRetry(() => store.setJSON(`results/${month}.json`, results), `set results/${month}.json`, tries);
+    let watchTotal = 0;
+    for (const dt of dates) { await withRetry(() => store.setJSON(`watch/${dt}.json`, byReg[dt]), `set watch/${dt}.json`, tries); watchTotal += byReg[dt].length; }
+    await withRetry(() => store.setJSON("watch/index.json", dates), "set watch/index.json", tries);
+    if (final) {
+      const keepSet = new Set(dates);
+      for (const dt of oldDates) if (!keepSet.has(dt)) { try { await store.delete(`watch/${dt}.json`); } catch {} }
+      stats.watchTotal = watchTotal;
+      stats.days.unshift({ date: today, src: nrd.list.length, probed: all.length, jp: cJp, watch: watchTotal, drop: cDrop });
+      stats.days = stats.days.slice(0, 60);
+      stats.updated = new Date().toISOString();
+      await withRetry(() => store.setJSON("meta/stats.json", stats), "set meta/stats.json", tries);
+    }
+    return watchTotal;
+  }
 
-  stats.watchTotal = watchTotal;
-  stats.days.unshift({ date: today, src: nrd.list.length, probed: all.length, jp: cJp, watch: cWatch, drop: cDrop });
-  stats.days = stats.days.slice(0, 60);
-  stats.updated = new Date().toISOString();
-  await setJSON("meta/stats.json", stats);
+  // 5) チャンク処理: 15,000件ごとにプローブ→振り分け→途中保存
+  //    (終盤にランナーのNAT枯渇で保存不能になっても、成果の大半が既に保存済みになる)
+  const CHUNK = +(process.env.NRD_CHUNK || 15000);
+  console.log(`probing ${all.length} domains @${CONCURRENCY} parallel, checkpoint every ${CHUNK} ...`);
+  const deadline = Date.now() + PROBE_BUDGET_MS;
+  let processed = 0;
+  for (let off = 0; off < all.length; off += CHUNK) {
+    const chunk = all.slice(off, off + CHUNK);
+    const res = await pool(chunk, item => probe(item.d), CONCURRENCY, { offset: off, total: all.length, deadline });
+    chunk.forEach((item, i) => dispatch(item, res[i]));
+    processed += chunk.length;
+    if (processed < all.length) {
+      try { await saveAll(false); console.log(`  checkpoint保存 @${processed}/${all.length} (JP累計${cJp})`); }
+      catch (e) { console.warn(`  checkpoint保存失敗(続行): ${e.message}`); }
+    }
+  }
 
-  console.log(`=== done: JP公開 ${cJp} / 監視 ${cWatch} / 除外 ${cDrop} ===`);
+  // 6) 最終保存: NAT(共有出口)のポート枯渇は数分で自然回復するため、待ってから保存
+  console.log("接続回復待ち 240s → 最終保存 ...");
+  await new Promise(r => setTimeout(r, process.env.NRD_MOCK ? 100 : 240000));
+  const watchTotal = await saveAll(true);
+
+  console.log(`=== done: JP公開 ${cJp} / 監視 ${watchTotal} / 除外 ${cDrop} ===`);
 }
 
 if (!process.env.NRD_TEST) {
