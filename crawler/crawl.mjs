@@ -342,7 +342,7 @@ async function main() {
   // 保存一式（チェックポイント兼最終保存）
   const oldDates = new Set(watchIndex);
   async function saveAll(final) {
-    const tries = final ? 8 : 3;
+    const tries = final ? 8 : 5;
     const byReg = {};
     for (const w of watchMap.values()) (byReg[w.reg] ||= []).push({ d: w.d, uni: w.uni, jp: w.jp, st: w.st });
     const dates = Object.keys(byReg).sort();
@@ -375,6 +375,9 @@ async function main() {
     chunk.forEach((item, i) => dispatch(item, res[i]));
     processed += chunk.length;
     if (processed < all.length) {
+      // プローブ直後は出口(NAT)が詰まっていて保存が通らないため、少し待って接続を解放してから保存
+      console.log("  checkpoint前 待機90s(接続解放)...");
+      await new Promise(r => setTimeout(r, process.env.NRD_MOCK ? 100 : 90000));
       try { await saveAll(false); console.log(`  checkpoint保存 @${processed}/${all.length} (JP累計${cJp})`); }
       catch (e) { console.warn(`  checkpoint保存失敗(続行): ${e.message}`); }
     }
