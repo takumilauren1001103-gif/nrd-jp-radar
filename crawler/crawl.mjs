@@ -7,6 +7,25 @@
 import { getStore } from "@netlify/blobs";
 import AdmZip from "adm-zip";
 import { lookup } from "node:dns/promises";
+import { fetch as probeFetch, Agent } from "undici";
+
+// プローブ専用の接続エージェント: 使い捨て設定でソケット/ポート枯渇を防ぐ
+// (9万接続をキープし続けると終盤にNetlifyへ繋ぐ余力がなくなり保存が死ぬ)
+function newProbeAgent() {
+  return new Agent({
+    connections: 1,               // 相手先ごとに1本まで
+    keepAliveTimeout: 500,        // 使い終わったら0.5秒で切断
+    keepAliveMaxTimeout: 500,
+    connect: { timeout: 5000 },
+  });
+}
+let probeAgent = newProbeAgent();
+function rotateProbeAgent() {     // 定期的に丸ごと作り直してメモリと接続台帳を掃除
+  const old = probeAgent;
+  probeAgent = newProbeAgent();
+  old.close().catch(() => {});
+}
+async function shutdownProbeAgent() { try { await probeAgent.destroy(); } catch {} }
 
 const SITE_ID = process.env.BLOBS_SITE_ID;
 const TOKEN = process.env.BLOBS_TOKEN;
@@ -177,8 +196,9 @@ function sniffDecode(buf, headerCT) {
 }
 
 async function probeOnce(url) {
-  const res = await fetch(url, {
+  const res = await probeFetch(url, {
     redirect: "follow",
+    dispatcher: probeAgent,
     headers: { "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "accept-language": "ja,en;q=0.8" },
     signal: AbortSignal.timeout(FETCH_TIMEOUT),
   });
@@ -226,6 +246,7 @@ async function pool(items, worker, size) {
       if (Date.now() - t0 > PROBE_BUDGET_MS) { results[i] = { state: "DEAD" }; skipped++; continue; } // 時間切れ分は明日回し
       results[i] = await worker(items[i]).catch(() => ({ state: "DEAD" }));
       if (++done % 2000 === 0) console.log(`  probed ${done}/${items.length} (${Math.round((Date.now() - t0) / 1000)}s)`);
+      if (done % 5000 === 0) rotateProbeAgent(); // 接続台帳の定期掃除
     }
   }));
   if (skipped) console.warn(`時間上限により ${skipped} 件をスキップ（監視リストで明日再チェック）`);
@@ -286,15 +307,20 @@ async function main() {
   }
   console.log(`watch: ${watchIndex.length}日分 / 今日の再チェック ${watchDue.length} / 据え置き ${carried} / 期限切れ破棄 ${expired}`);
 
-  // 3) プローブ（新規 + 監視分）
+  // 3) 台帳の先読み（ネットワークが健全なプローブ前に読み込みを済ませ、後半は書き込みだけにする）
+  const month = today.slice(0, 7);
+  const results = await getJSON(`results/${month}.json`, []);
+  const stats = await getJSON("meta/stats.json", { days: [] });
+
+  // 4) プローブ（新規 + 監視分）
   const newItems = fresh.map(f => ({ d: f.d, uni: f.uni, jpHint: f.jpHint, reg: nrd.date, isNew: true }));
   const all = [...newItems, ...watchDue];
   console.log(`probing ${all.length} domains @${CONCURRENCY} parallel ...`);
   const res = await pool(all, item => probe(item.d), CONCURRENCY);
+  await shutdownProbeAgent();                    // プローブ接続を完全破棄
+  await new Promise(r => setTimeout(r, 3000));   // ソケットの後始末を待つ
 
-  // 4) 振り分け
-  const month = today.slice(0, 7);
-  const results = await getJSON(`results/${month}.json`, []);
+  // 5) 振り分け
   const known = new Set(results.map(r => r.d));
   const newWatch = {}; // regDate -> entries
   // 据え置き分を先にマージ
@@ -333,7 +359,6 @@ async function main() {
   for (const dt of dates) { await setJSON(`watch/${dt}.json`, newWatch[dt]); watchTotal += newWatch[dt].length; }
   await setJSON("watch/index.json", dates);
 
-  const stats = await getJSON("meta/stats.json", { days: [] });
   stats.watchTotal = watchTotal;
   stats.days.unshift({ date: today, src: nrd.list.length, probed: all.length, jp: cJp, watch: cWatch, drop: cDrop });
   stats.days = stats.days.slice(0, 60);
