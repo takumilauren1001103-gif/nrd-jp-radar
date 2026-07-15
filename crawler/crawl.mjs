@@ -7,6 +7,10 @@
 import { getStore } from "@netlify/blobs";
 import AdmZip from "adm-zip";
 import { lookup } from "node:dns/promises";
+import { execFile } from "node:child_process";
+import { writeFileSync, unlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const SITE_ID = process.env.BLOBS_SITE_ID;
 const TOKEN = process.env.BLOBS_TOKEN;
@@ -256,6 +260,23 @@ async function getJSON(key, fallback) {
 }
 const setJSON = (key, val) => withRetry(() => store.setJSON(key, val), `set ${key}`);
 
+// まっさらな別プロセスで保存する（プローブで溜まった接続の影響を受けない）
+function saveViaWorker(payload) {
+  return new Promise((resolve, reject) => {
+    const file = join(tmpdir(), `nrd-save-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+    writeFileSync(file, JSON.stringify(payload));
+    execFile(process.execPath, ["save-worker.mjs", file],
+      { env: process.env, timeout: 15 * 60 * 1000, maxBuffer: 10 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        try { unlinkSync(file); } catch {}
+        if (stdout?.trim()) console.log(stdout.trim());
+        if (stderr?.trim()) console.warn(stderr.trim());
+        if (err) reject(new Error(`save-worker exit ${err.code ?? err.message}`));
+        else resolve();
+      });
+  });
+}
+
 // ---------------- メイン ----------------
 // 起動時カナリア: 確実に生きている日本サイトが1つも検出できない = ランナーのネットワーク不調。
 // 全件DEAD誤判定で1日を無駄にする前に、台帳に触らず中止する。
@@ -339,27 +360,28 @@ async function main() {
     }
   }
 
-  // 保存一式（チェックポイント兼最終保存）
+  // 保存一式: 全キーを1つのペイロードにまとめ、まっさらな別プロセスで書き込む
   const oldDates = new Set(watchIndex);
   async function saveAll(final) {
-    const tries = final ? 8 : 5;
     const byReg = {};
     for (const w of watchMap.values()) (byReg[w.reg] ||= []).push({ d: w.d, uni: w.uni, jp: w.jp, st: w.st });
     const dates = Object.keys(byReg).sort();
     results.sort((a, b) => (a.pub < b.pub ? 1 : -1));
-    await withRetry(() => store.setJSON(`results/${month}.json`, results), `set results/${month}.json`, tries);
     let watchTotal = 0;
-    for (const dt of dates) { await withRetry(() => store.setJSON(`watch/${dt}.json`, byReg[dt]), `set watch/${dt}.json`, tries); watchTotal += byReg[dt].length; }
-    await withRetry(() => store.setJSON("watch/index.json", dates), "set watch/index.json", tries);
+    const payload = {};
+    payload[`results/${month}.json`] = results;
+    for (const dt of dates) { payload[`watch/${dt}.json`] = byReg[dt]; watchTotal += byReg[dt].length; }
+    payload["watch/index.json"] = dates;
     if (final) {
       const keepSet = new Set(dates);
-      for (const dt of oldDates) if (!keepSet.has(dt)) { try { await store.delete(`watch/${dt}.json`); } catch {} }
+      for (const dt of oldDates) if (!keepSet.has(dt)) payload[`watch/${dt}.json`] = null; // 削除指示
       stats.watchTotal = watchTotal;
       stats.days.unshift({ date: today, src: nrd.list.length, probed: all.length, jp: cJp, watch: watchTotal, drop: cDrop });
       stats.days = stats.days.slice(0, 60);
       stats.updated = new Date().toISOString();
-      await withRetry(() => store.setJSON("meta/stats.json", stats), "set meta/stats.json", tries);
+      payload["meta/stats.json"] = stats;
     }
+    await saveViaWorker(payload);
     return watchTotal;
   }
 
@@ -375,17 +397,13 @@ async function main() {
     chunk.forEach((item, i) => dispatch(item, res[i]));
     processed += chunk.length;
     if (processed < all.length) {
-      // プローブ直後は出口(NAT)が詰まっていて保存が通らないため、少し待って接続を解放してから保存
-      console.log("  checkpoint前 待機90s(接続解放)...");
-      await new Promise(r => setTimeout(r, process.env.NRD_MOCK ? 100 : 90000));
       try { await saveAll(false); console.log(`  checkpoint保存 @${processed}/${all.length} (JP累計${cJp})`); }
-      catch (e) { console.warn(`  checkpoint保存失敗(続行): ${e.message}`); }
+      catch (e) { console.warn(`  checkpoint保存失敗(続行・次回持越): ${e.message}`); }
     }
   }
 
-  // 6) 最終保存: NAT(共有出口)のポート枯渇は数分で自然回復するため、待ってから保存
-  console.log("接続回復待ち 240s → 最終保存 ...");
-  await new Promise(r => setTimeout(r, process.env.NRD_MOCK ? 100 : 240000));
+  // 6) 最終保存: 別プロセスがクリーンな接続で書き込む（親の接続汚染の影響を受けない）
+  console.log("最終保存(別プロセス) ...");
   const watchTotal = await saveAll(true);
 
   console.log(`=== done: JP公開 ${cJp} / 監視 ${watchTotal} / 除外 ${cDrop} ===`);
