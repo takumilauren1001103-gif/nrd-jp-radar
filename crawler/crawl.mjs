@@ -359,8 +359,25 @@ async function main() {
 
   // 3) 台帳の先読み（ネットワークが健全なプローブ前に読み込みを済ませ、後半は書き込みだけにする）
   const month = today.slice(0, 7);
-  const results = await getJSON(`results/${month}.json`, []);
+  let results = await getJSON(`results/${month}.json`, []);
   const stats = await getJSON("meta/stats.json", { days: [] });
+
+  // 3.5) 一度だけの大掃除: 旧判定で混入した外国サイトを、新判定で再検査して台帳から削除。
+  //      中国語/外国語と「確定」したものだけ消す。一時的に繋がらないだけのサイトは残す（誤削除防止）。
+  const cleaned = await getJSON("meta/cleanup-v3.json", null);
+  if (!cleaned && results.length > 0) {
+    console.log(`大掃除: 既存リード ${results.length}件を新判定で再検査 ...`);
+    const rs = await pool(results, item => probe(item.d), CONCURRENCY);
+    const keep = [];
+    let purged = 0;
+    results.forEach((item, i) => {
+      const st = rs[i].state;
+      if (st === "CN" || st === "LIVE_OTHER") { purged++; }   // 外国と確定 → 削除
+      else keep.push(item);                                     // 日本 or 一時不達 → 残す
+    });
+    results = keep;
+    console.log(`大掃除完了: ${purged}件を外国サイトとして削除 / ${keep.length}件を保持`);
+  }
   const known = new Set(results.map(r => r.d));
 
   // 4) クラッシュ耐性のある監視台帳: 先に全対象を「保留」として登録し、判定のたびに更新/削除。
@@ -414,6 +431,7 @@ async function main() {
       stats.days = stats.days.slice(0, 60);
       stats.updated = new Date().toISOString();
       payload["meta/stats.json"] = stats;
+      payload["meta/cleanup-v3.json"] = { done: true, at: new Date().toISOString() };
     }
     await saveViaWorker(payload);
     return watchTotal;
