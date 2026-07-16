@@ -10,7 +10,7 @@
 if (process.env.UV_THREADPOOL_SIZE !== "128" && !process.env.NRD_REEXEC && !process.env.NRD_TEST) {
   const { spawnSync } = await import("node:child_process");
   const self = new URL(import.meta.url).pathname;
-  const r = spawnSync(process.execPath, [self, ...process.argv.slice(2)], {
+  const r = spawnSync(process.execPath, ["--max-old-space-size=7168", self, ...process.argv.slice(2)], {
     stdio: "inherit",
     env: { ...process.env, UV_THREADPOOL_SIZE: "128", NRD_REEXEC: "1" },
   });
@@ -47,7 +47,7 @@ function makeMockStore() {
 const CONCURRENCY = 45;        // 並列プローブ数
 const FETCH_TIMEOUT = 6000;     // 1ドメインのタイムアウト(ms)
 const PROBE_BUDGET_MS = 140 * 60 * 1000; // プローブ全体の時間上限(超過分は明日回し)
-const BODY_CAP = 65536;         // HTML読み取り上限(バイト)
+const BODY_CAP = 32768;         // HTML読み取り上限(バイト) — charset/lang/かな判定には十分
 
 // 監視の階層:
 //  strong = .jp/かな/日本語気配 (②日本っぽい未公開) → 60日じっくり追う
@@ -237,7 +237,7 @@ async function probe(domain) {
   const hira = (scope.match(HIRA_G) || []).length;
   const kata = (scope.match(KATA_G) || []).length;
   const cnSpam = (scope.match(CN_SPAM_G) || []).length;
-  const foreign = (scope.match(/[\u0E00-\u0E7F\u0400-\u04FF\u0600-\u06FF]/g) || []).length; // タイ/キリル/アラビア
+  const foreign = (scope.match(/[\u0E00-\u0E7F\u0400-\u04FF\u0600-\u06FF\uAC00-\uD7A3\u1100-\u11FF]/g) || []).length; // タイ/キリル/アラビア/ハングル(韓国語)
 
   // 中国語判定を最優先（かなが混じっていても、中国語シグナルが強ければ中国語）
   const cn = CN_CHARSET_RE.test(text) || cnSpam >= 2 || simpCnCount(scope) >= 3;
@@ -362,21 +362,20 @@ async function main() {
   let results = await getJSON(`results/${month}.json`, []);
   const stats = await getJSON("meta/stats.json", { days: [] });
 
-  // 3.5) 一度だけの大掃除: 旧判定で混入した外国サイトを、新判定で再検査して台帳から削除。
-  //      中国語/外国語と「確定」したものだけ消す。一時的に繋がらないだけのサイトは残す（誤削除防止）。
-  const cleaned = await getJSON("meta/cleanup-v3.json", null);
-  if (!cleaned && results.length > 0) {
-    console.log(`大掃除: 既存リード ${results.length}件を新判定で再検査 ...`);
+  // 3.5) リード再検査（毎回）: 既存リードを新判定で再チェックし、外国サイトと確定したものを削除。
+  //      リードは高々数千件なので毎回でも軽い。今回DEADでも次回クリーンに読めた時に消える(自己修復)。
+  if (results.length > 0) {
+    console.log(`リード再検査: 既存 ${results.length}件 ...`);
     const rs = await pool(results, item => probe(item.d), CONCURRENCY);
     const keep = [];
     let purged = 0;
     results.forEach((item, i) => {
       const st = rs[i].state;
-      if (st === "CN" || st === "LIVE_OTHER") { purged++; }   // 外国と確定 → 削除
-      else keep.push(item);                                     // 日本 or 一時不達 → 残す
+      if (st === "CN" || st === "LIVE_OTHER") purged++;   // 外国と確定 → 削除
+      else keep.push(item);                                // 日本 or 一時不達 → 残す
     });
     results = keep;
-    console.log(`大掃除完了: ${purged}件を外国サイトとして削除 / ${keep.length}件を保持`);
+    console.log(`リード再検査完了: ${purged}件を外国サイトとして削除 / ${keep.length}件を保持`);
   }
   const known = new Set(results.map(r => r.d));
 
@@ -386,9 +385,14 @@ async function main() {
   for (const [regDate, entries] of Object.entries(keepByReg))
     for (const e of entries) watchMap.set(e.d, { ...e, reg: regDate });
   const newItems = fresh.map(f => ({ d: f.d, uni: f.uni, jpHint: f.jpHint, reg: nrd.date, isNew: true }));
-  const all = [...newItems, ...watchDue];
-  for (const it of all)
+  // watchMapには全件を先に登録（未処理でも既存状態を保持）
+  for (const it of [...newItems, ...watchDue])
     watchMap.set(it.d, { d: it.d, uni: it.uni !== it.d ? it.uni : undefined, jp: it.jpHint || 0, st: it.st || "PEND", reg: it.reg });
+  // 1回の実行で実際にプローブする上限（メモリ保護）。新規(日本優先)を先に、残り枠で監視分。超過分は次回。
+  const PROBE_CAP = +(process.env.NRD_PROBE_CAP || 70000);
+  const all = [...newItems, ...watchDue].slice(0, PROBE_CAP);
+  if (newItems.length + watchDue.length > PROBE_CAP)
+    console.log(`対象 ${newItems.length + watchDue.length}件 → 今回は${PROBE_CAP}件を処理（残りは次回）`);
 
   let cJp = 0, cDrop = 0;
   function dispatch(item, r) {
@@ -431,7 +435,6 @@ async function main() {
       stats.days = stats.days.slice(0, 60);
       stats.updated = new Date().toISOString();
       payload["meta/stats.json"] = stats;
-      payload["meta/cleanup-v3.json"] = { done: true, at: new Date().toISOString() };
     }
     await saveViaWorker(payload);
     return watchTotal;
@@ -452,6 +455,17 @@ async function main() {
       try { await saveAll(false); console.log(`  checkpoint保存 @${processed}/${all.length} (JP累計${cJp})`); }
       catch (e) { console.warn(`  checkpoint保存失敗(続行・次回持越): ${e.message}`); }
     }
+  }
+
+  // 監視リストの上限管理: 膨張を防ぐため上限を超えたら古い順に捨てる（.jp/かな等の有望株は優先保持）
+  const WATCH_CAP = +(process.env.NRD_WATCH_CAP || 150000);
+  if (watchMap.size > WATCH_CAP) {
+    const arr = [...watchMap.values()];
+    // 優先度: jpHintあり > 新しい登録日。低い順に削る
+    arr.sort((a, b) => (a.jp - b.jp) || (a.reg < b.reg ? -1 : a.reg > b.reg ? 1 : 0));
+    const drop = arr.slice(0, watchMap.size - WATCH_CAP);
+    for (const e of drop) watchMap.delete(e.d);
+    console.log(`監視リスト圧縮: ${drop.length}件を削除（上限${WATCH_CAP}件を維持）`);
   }
 
   // 6) 最終保存: 別プロセスがクリーンな接続で書き込む（親の接続汚染の影響を受けない）
