@@ -4,6 +4,19 @@
 // 未公開ドメインは監視リストで追い、公開した瞬間に新規公開として記録。
 // 状態は Netlify Blobs（ダッシュボードと共有）に保存。
 // ============================================================
+
+// DNS解決はlibuvスレッドプール(デフォルト4)を使うため、45並列で叩くと行列待ちで
+// 大量タイムアウト→全件DEAD誤判定になる。起動直後に自分を再実行してプールを128に拡張。
+if (process.env.UV_THREADPOOL_SIZE !== "128" && !process.env.NRD_REEXEC && !process.env.NRD_TEST) {
+  const { spawnSync } = await import("node:child_process");
+  const self = new URL(import.meta.url).pathname;
+  const r = spawnSync(process.execPath, [self, ...process.argv.slice(2)], {
+    stdio: "inherit",
+    env: { ...process.env, UV_THREADPOOL_SIZE: "128", NRD_REEXEC: "1" },
+  });
+  process.exit(r.status ?? 1);
+}
+
 import { getStore } from "@netlify/blobs";
 import AdmZip from "adm-zip";
 import { lookup } from "node:dns/promises";
@@ -196,7 +209,7 @@ async function probe(domain) {
   try {
     await Promise.race([
       lookup(domain),
-      new Promise((_, rej) => setTimeout(() => rej(new Error("dns timeout")), 2500)),
+      new Promise((_, rej) => setTimeout(() => rej(new Error("dns timeout")), 5000)),
     ]);
   } catch { return { state: "DEAD" }; }
   let r = null;
