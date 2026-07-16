@@ -66,19 +66,32 @@ const FOREIGN_CC = new Set(("cn ru in fr de uk br it es nl pl tr id vn th kr tw 
   "ir sa ae eu se no fi dk cz gr pt ro hu at ch be ie il eg ng pk bd lk np mm kh la md rs bg sk si lt lv ee hr ba mk al ge am az uz").split(" "));
 
 const KANA_RE = /[\u3041-\u3096\u30A1-\u30FA\u30FC\u31F0-\u31FF]/;
+const HIRA_G = /[\u3041-\u3096]/g;                 // ひらがな(日本語で頻出・中国語にほぼ無い)
+const KATA_G = /[\u30A1-\u30FA\u30FC]/g;           // カタカナ
 const HAN_RE = /[\u4E00-\u9FFF\u3400-\u4DBF]/;
 const FOREIGN_SCRIPT_RE = /[\uAC00-\uD7A3\u1100-\u11FF\u0400-\u04FF\u0600-\u06FF\u0E00-\u0E7F]/; // ハングル/キリル/アラビア/タイ
 
 const PARKED_RE = new RegExp([
-  "coming\\s*soon", "under\\s*construction", "準備中", "工事中", "近日公開", "ただいま準備",
+  "coming\\s*soon", "under\\s*construction", "準備中", "工事中", "近日公開", "近日中に公開", "ただいま準備",
+  "読み込み中", "少々お待ち", "仮サイト", "サイト準備", "ページを表示できません",
   "domain\\s+is\\s+parked", "parked\\s+free", "sedoparking", "buy\\s+this\\s+domain", "domain\\s+for\\s+sale",
   "このドメインは", "お名前\\.com", "ムームードメイン", "エックスサーバー.*初期", "さくらのレンタルサーバ.*標準",
   "welcome\\s+to\\s+nginx", "apache2\\s+ubuntu\\s+default", "iis\\s+windows\\s+server", "it\\s+works!",
-  "default\\s+(web\\s+)?page", "plesk", "cpanel", "index\\s+of\\s*/"
+  "caddy\\s+works", "default\\s+(web\\s+)?page", "plesk", "cpanel", "index\\s+of\\s*/"
 ].join("|"), "i");
 
-const CN_RE = /charset\s*=\s*["']?\s*(gb2312|gbk|gb18030|big5)|lang\s*=\s*["']?zh|(备案|ICP备|公安备)/i;
+const CN_CHARSET_RE = /charset\s*=\s*["']?\s*(gb2312|gbk|gb18030|big5)|lang\s*=\s*["']?zh|(备案|ICP备|公安备)/i;
+// 中国語ストリーミング/アダルト定番フレーズ(簡体字)。日本語ページにはまず出ない
+const CN_SPAM_G = /(免费观看|在线观看|无码|国产|亚洲|视频|做爱|电视剧|电影|里番|吃瓜|爆料|福利|每日更新|官网入口|成人|导航|高清|资源|精品|合集)/g;
+// 簡体字専用の文字(日本の漢字表記には現れない字形のみ厳選)。3種以上で中国語とみなす
+const SIMP_CN = new Set("们么这还开关门问题见观视频费产电买卖东车书说语实现网页导购优过样丽义乐张继让应广汉击众达无码资讯语军农决况亚级实约红细继绩练给绝统丝纪线终组织经罗规视觉话该请诉读谁贵费".split(""));
 const JA_META_RE = /lang\s*=\s*["']?ja|charset\s*=\s*["']?\s*(shift_jis|x-sjis|euc-jp)|og:locale["'][^>]*ja_JP/i;
+
+function simpCnCount(text) {
+  const seen = new Set();
+  for (const ch of text) if (SIMP_CN.has(ch)) { seen.add(ch); if (seen.size >= 3) return 3; }
+  return seen.size;
+}
 
 // ---------------- ユーティリティ ----------------
 const todayISO = () => new Date().toISOString().slice(0, 10);
@@ -220,16 +233,24 @@ async function probe(domain) {
   const { text, cs } = sniffDecode(r.buf, r.ct);
   const size = r.buf.length;
   const title = (text.match(/<title[^>]*>([^<]{0,120})/i) || [])[1]?.trim().replace(/\s+/g, " ") || "";
-  const kana = KANA_RE.test(text) || KANA_RE.test(title);
-  const jaMeta = JA_META_RE.test(text) || /^(shift_jis|euc-jp)$/.test(cs);
-  const cn = !kana && CN_RE.test(text);
-  const parked = PARKED_RE.test(text);
+  const scope = title + " " + text;
+  const hira = (scope.match(HIRA_G) || []).length;
+  const kata = (scope.match(KATA_G) || []).length;
+  const cnSpam = (scope.match(CN_SPAM_G) || []).length;
+  const foreign = (scope.match(/[\u0E00-\u0E7F\u0400-\u04FF\u0600-\u06FF]/g) || []).length; // タイ/キリル/アラビア
+
+  // 中国語判定を最優先（かなが混じっていても、中国語シグナルが強ければ中国語）
+  const cn = CN_CHARSET_RE.test(text) || cnSpam >= 2 || simpCnCount(scope) >= 3;
+  const parked = PARKED_RE.test(text) || PARKED_RE.test(title);
+  // 日本語判定: ひらがな十分 or カタカナ十分。ただし外国文字が優勢なら日本語ではない
+  const isJa = foreign < 5 && foreign <= hira + kata &&
+    (hira >= 5 || kata >= 8 || (JA_META_RE.test(text) && (hira + kata) >= 2));
 
   if (r.status >= 500 || size === 0) return { state: "DEAD" };
   if (cn) return { state: "CN" };
-  if (parked) return { state: "PARKED", jp: kana || jaMeta ? 1 : 0, title };
-  if (size < 900 || r.status === 401 || r.status === 403 || r.status === 404) return { state: "TINY", jp: kana || jaMeta ? 1 : 0, title };
-  if (kana || jaMeta) return { state: "LIVE_JP", title, ev: kana ? "kana" : "meta" };
+  if (parked) return { state: "PARKED", jp: isJa ? 1 : 0, title };
+  if (size < 900 || r.status === 401 || r.status === 403 || r.status === 404) return { state: "TINY", jp: isJa ? 1 : 0, title };
+  if (isJa) return { state: "LIVE_JP", title, ev: hira >= 5 ? "hira" : "kata" };
   return { state: "LIVE_OTHER" };
 }
 
@@ -294,11 +315,11 @@ function saveViaWorker(payload) {
 // 起動時カナリア: 確実に生きている日本サイトが1つも検出できない = ランナーのネットワーク不調。
 // 全件DEAD誤判定で1日を無駄にする前に、台帳に触らず中止する。
 async function canaryCheck() {
-  const canaries = ["www.yahoo.co.jp", "www.google.co.jp", "www.nhk.or.jp"];
+  const canaries = ["www.yahoo.co.jp", "www.kantei.go.jp", "www.nhk.or.jp", "www.google.co.jp"];
   const rs = await Promise.all(canaries.map(d => probe(d)));
-  const ok = rs.filter(r => r.state === "LIVE_JP").length;
-  console.log(`canary: ${ok}/${canaries.length} 検出`);
-  if (ok === 0) {
+  const reachable = rs.filter(r => r.state !== "DEAD").length; // ネットワーク疎通の確認
+  console.log(`canary: ${reachable}/${canaries.length} 到達`);
+  if (reachable === 0) {
     console.error("カナリア全滅: ランナーのネットワークが不調のため中止（台帳は無変更・次回の定時実行で自動リトライ）");
     process.exit(1);
   }
